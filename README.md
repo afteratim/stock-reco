@@ -106,3 +106,7 @@ Included in this project: login/session handling, PostgreSQL-backed chats/groups
 Before real use, test all calculations against your stock data. Product matching is heuristic and must be manually checked; this app does not guarantee that fuzzy suggestions are correct. The HTML chat export is a readable archive; JSON is the restorable backup. The current export produces the saved report rather than necessarily applying the current on-screen filters. Automatic draft recovery, undo/audit history, cross-date comparison, and global search were explicitly deferred for a later version.
 
 Use a private GitHub repository. Keep `DATABASE_URL`, `SESSION_SECRET`, `ADMIN_EMAIL`, and `ADMIN_PASSWORD` in Render environment variables only. Do not commit `.env` or share connection strings.
+
+## Matching and physical packing inference update
+
+The reconciliation logic normalizes spacing in size labels (for example, `80mm` and `80 MM`), scores shared core product-name tokens, and does not treat an attribute that is absent from one name as a contradiction by itself. When a physical line has boxes plus loose pieces but no explicit pieces-per-box, the app may infer the pack size from a strongly matched Actual product name ending in a numeric code (for example `SC-7200`). Such inferred quantities are marked `REVIEW` with an explanation and are not silently accepted as a final match. Please verify that the trailing code really represents pieces per box for that product.
