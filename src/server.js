@@ -227,22 +227,39 @@ app.get('*', (_req,res)=>res.sendFile(path.join(__dirname,'..','public','index.h
 
 initDb().then(()=>{
   const server = app.listen(PORT,()=>console.log(`Stock Reconciliation listening on ${PORT}`));
-  // Optional local self-ping loop for diagnostics/testing. This does NOT keep a Render
-  // free web service awake: only inbound external traffic can affect Render's idle timer,
-  // and an in-process timer stops when the service is suspended.
-  const pingEnabled = String(process.env.SELF_PING_ENABLED || 'false').toLowerCase() === 'true';
-  const pingIntervalMs = Math.max(15000, Number(process.env.SELF_PING_INTERVAL_MS || 60000));
+  // Optional self-ping loop. Set SELF_PING_URL to the full public health URL,
+  // for example https://your-service.onrender.com/api/health. If it is omitted,
+  // the loop falls back to the local health endpoint. This in-process loop is
+  // best-effort only and cannot reliably prevent Render Free services from sleeping.
+  const pingEnabled = ['true', '1', 'yes', 'on'].includes(
+    String(process.env.SELF_PING_ENABLED || 'false').trim().toLowerCase()
+  );
+  const parsedInterval = Number(process.env.SELF_PING_INTERVAL_MS || 60000);
+  const pingIntervalMs = Number.isFinite(parsedInterval) ? Math.max(15000, parsedInterval) : 60000;
   if (pingEnabled) {
-    const pingUrl = `http://127.0.0.1:${PORT}/api/health`;
-    const pingOnce = async () => {
-      try {
-        const response = await fetch(pingUrl, { signal: AbortSignal.timeout(10000) });
-        // Intentionally no per-ping logging to avoid noisy logs.
-        if (!response.ok) { /* next interval retries */ }
-      } catch (_) { /* next interval retries; no sensitive details logged */ }
-    };
-    const timer = setInterval(pingOnce, pingIntervalMs);
-    timer.unref();
-    console.log(`Local self-ping diagnostics enabled (interval ${pingIntervalMs}ms); this does not prevent Render free-tier sleep.`);
+    const configuredPingUrl = String(process.env.SELF_PING_URL || '').trim();
+    const pingUrl = configuredPingUrl || `http://127.0.0.1:${PORT}/api/health`;
+    let validPingUrl = false;
+    try {
+      const parsedUrl = new URL(pingUrl);
+      validPingUrl = ['http:', 'https:'].includes(parsedUrl.protocol);
+    } catch (_) { /* invalid URL handled below without printing secrets */ }
+
+    if (!validPingUrl) {
+      console.error('Self-ping is enabled, but SELF_PING_URL must be a valid HTTP or HTTPS URL.');
+    } else {
+      const pingOnce = async () => {
+        try {
+          const response = await fetch(pingUrl, { signal: AbortSignal.timeout(10000) });
+          // Do not log every ping; retry on the next interval if the response is unsuccessful.
+          if (!response.ok) { /* next interval retries */ }
+        } catch (_) { /* next interval retries; do not log URL or sensitive details */ }
+      };
+      // Run once shortly after startup, then at the configured interval.
+      setTimeout(pingOnce, 5000).unref();
+      const timer = setInterval(pingOnce, pingIntervalMs);
+      timer.unref();
+      console.log(`Self-ping enabled (interval ${pingIntervalMs}ms; URL configured: ${Boolean(configuredPingUrl)}). It cannot guarantee prevention of Render Free sleep.`);
+    }
   }
 }).catch(err=>{console.error('Database initialization failed:',err.message);process.exit(1);});
