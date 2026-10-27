@@ -34,27 +34,84 @@ async function restoreBackup(){const file=$('restoreFile')?.files?.[0];if(!file)
 async function groupsModal(){const rows=state.groups.map(g=>`<div class="history-item"><div><b>${esc(g.name)}</b><p>Stock group</p></div><div><button class="row-action" data-edit-group="${g.id}">Rename</button> <button class="row-action danger-text" data-delete-group="${g.id}">Delete</button></div></div>`).join('');modal('Stock groups',`<div class="modal-body"><p>Create a group for each stock list you reconcile, such as Abhinav or National.</p><label class="modal-field">New group name<input id="newGroupName" placeholder="e.g. Abhinav"></label><div id="groupRows">${rows||'<p class="muted">No groups created yet.</p>'}</div></div>`,[{label:'Close',onClick:closeModal},{label:'Add group',className:'primary',onClick:async()=>{const name=$('newGroupName').value.trim();if(!name)return toast('Enter a group name.',true);try{await api('/api/groups',{method:'POST',body:JSON.stringify({name})});await refreshAll();closeModal();groupsModal();toast('Stock group added.');}catch(e){toast(e.message,true);}}}]);$('modalBody').querySelectorAll('[data-edit-group]').forEach(b=>b.onclick=()=>editGroup(b.dataset.editGroup));$('modalBody').querySelectorAll('[data-delete-group]').forEach(b=>b.onclick=()=>deleteGroup(b.dataset.deleteGroup));}
 async function editGroup(gid){const g=state.groups.find(x=>String(x.id)===String(gid));if(!g)return;modal('Rename stock group',`<label class="modal-field">Group name<input id="groupRename" value="${esc(g.name)}"></label>`,[{label:'Cancel',onClick:()=>{closeModal();groupsModal();}},{label:'Save',className:'primary',onClick:async()=>{try{await api('/api/groups/'+gid,{method:'PATCH',body:JSON.stringify({name:$('groupRename').value.trim()})});await refreshAll();closeModal();groupsModal();toast('Group renamed.');}catch(e){toast(e.message,true);}}}]);}
 async function deleteGroup(gid){const g=state.groups.find(x=>String(x.id)===String(gid));modal('Delete stock group?',`<p>Delete <b>${esc(g?.name||'this group')}</b>? Existing chats and reports will be kept but unlinked from the group.</p>`,[{label:'Cancel',onClick:()=>{closeModal();groupsModal();}},{label:'Delete group',className:'primary',onClick:async()=>{try{await api('/api/groups/'+gid,{method:'DELETE'});await refreshAll();closeModal();groupsModal();toast('Group deleted.');}catch(e){toast(e.message,true);}}}]);}
-function normalizeName(s){return String(s||'').toLowerCase().normalize('NFKD').replace(/[×x]/g,'x').replace(/[^a-z0-9]+/g,' ').replace(/\b(product|pcs|pieces|piece|qty|quantity)\b/g,' ').replace(/\s+/g,' ').trim();}
+function normalizeName(s){
+  return String(s||'').toLowerCase().normalize('NFKD')
+    .replace(/[×x]/g,'x')
+    .replace(/(\d+(?:\.\d+)?)\s*mm\b/g,'$1 mm')
+    .replace(/(\d+(?:\.\d+)?)\s*ml\b/g,'$1 ml')
+    .replace(/[^a-z0-9.]+/g,' ')
+    .replace(/\b(product|pcs|pieces|piece|qty|quantity)\b/g,' ')
+    .replace(/\s+/g,' ').trim();
+}
 function tokenSet(s){return new Set(normalizeName(s).split(' ').filter(Boolean));}
-function similarity(a,b){const A=normalizeName(a),B=normalizeName(b);if(!A||!B)return 0;if(A===B)return 1;const ta=tokenSet(A),tb=tokenSet(B);const inter=[...ta].filter(x=>tb.has(x)).length;const dice=2*inter/(ta.size+tb.size||1);const aa=A.replace(/\s/g,''),bb=B.replace(/\s/g,'');let prev=Array.from({length:bb.length+1},(_,i)=>i);for(let i=1;i<=aa.length;i++){const cur=[i];for(let j=1;j<=bb.length;j++)cur[j]=Math.min(cur[j-1]+1,prev[j]+1,prev[j-1]+(aa[i-1]===bb[j-1]?0:1));prev=cur;}const lev=1-prev[bb.length]/Math.max(aa.length,bb.length,1);return Math.max(dice*.8,lev);}
+function similarity(a,b){
+  const A=normalizeName(a),B=normalizeName(b);if(!A||!B)return 0;if(A===B)return 1;
+  const ta=tokenSet(A),tb=tokenSet(B),inter=[...ta].filter(x=>tb.has(x));
+  const dice=2*inter.length/(ta.size+tb.size||1);
+  const containment=inter.length/Math.max(1,Math.min(ta.size,tb.size));
+  const coreTokens=s=>new Set(normalizeName(s).split(' ').filter(t=>!/^\d{3,6}$/.test(t)&&!['pet','abh','abhnav','abhinav','nat','natural','sc'].includes(t)));
+  const ca=coreTokens(a),cb=coreTokens(b),ci=[...ca].filter(x=>cb.has(x)).length;
+  const coreContain=ci/Math.max(1,Math.min(ca.size,cb.size));
+  const aa=A.replace(/\s/g,''),bb=B.replace(/\s/g,'');
+  let prev=Array.from({length:bb.length+1},(_,i)=>i);
+  for(let i=1;i<=aa.length;i++){const cur=[i];for(let j=1;j<=bb.length;j++)cur[j]=Math.min(cur[j-1]+1,prev[j]+1,prev[j-1]+(aa[i-1]===bb[j-1]?0:1));prev=cur;}
+  const lev=1-prev[bb.length]/Math.max(aa.length,bb.length,1);
+  // Short names contained in longer names (e.g. "80mm dom lid" vs
+  // "80 MM DOM LID PET ABH SC-7200") should score highly.
+  return Math.min(1,Math.max(dice*.8,lev,containment*.94,coreContain*.96));
+}
 function parseActual(text){const lines=String(text||'').split(/\r?\n/).map(s=>s.trim()).filter(Boolean);const out=[];for(let line of lines){if(/^(particulars|name|product name|item name)\s*[\t,;| ]+.*(actual quantity|quantity|qty)/i.test(line)||/^particulars\s+actual quantity/i.test(line))continue;let name='',qty=null;const tab=line.split(/[\t|;]+/).map(s=>s.trim()).filter(Boolean);if(tab.length>=2){name=tab.slice(0,-1).join(' ');qty=parseNum(tab[tab.length-1]);}else{const csv=line.match(/^\s*"?(.+?)"?\s*,\s*"?([\d,.-]+)"?\s*$/);if(csv){name=csv[1];qty=parseNum(csv[2]);}else{const m=line.match(/^(.*?)\s{2,}([\d,.-]+)\s*$/);if(m){name=m[1];qty=parseNum(m[2]);}else{const m2=line.match(/^(.*?)\s*[:=]\s*([\d,.-]+)\s*$/);if(m2){name=m2[1];qty=parseNum(m2[2]);}}}}if(name&&qty!==null)out.push({name:name.trim(),qty,raw:line});else if(name)out.push({name:name.trim(),qty:null,raw:line,invalid:true});}return out;}
 function parseNum(s){if(s===null||s===undefined)return null;const n=Number(String(s).replace(/,/g,'').trim());return Number.isFinite(n)?n:null;}
 function parsePhysical(text){const lines=String(text||'').split(/\r?\n/).map(s=>s.trim()).filter(Boolean);const out=[];for(let line of lines){if(/^(product|particulars|name|physical stock)\b/i.test(line)&&/qty|quantity/i.test(line))continue;const qm=line.match(/(?:^|\s)(\?)\s*$/);if(qm){const name=line.slice(0,qm.index).trim();if(name)out.push({name,qty:0,raw:line,unknown:true,boxes:null,loose:0});continue;}
     let m=line.match(/^(.*?)\s+(\d+(?:\.\d+)?)\s*(?:box|boxes|bx|bxs|ctn|carton|cartons)\b(?:\s+(\d+(?:\.\d+)?)\s*(?:pcs?|pieces?|pes|pc))?\s*$/i);
-    if(m){const name=m[1].trim();const boxes=Number(m[2]);const loose=Number(m[3]||0);const pack=extractPack(name);if(pack){out.push({name,qty:boxes*pack+loose,raw:line,boxes,loose,pack});}else out.push({name,qty:null,raw:line,boxes,loose,pack:null,invalid:true,reason:'Packing size not known; enter pieces per box.'});continue;}
+    if(m){const name=m[1].trim();const boxes=Number(m[2]);const loose=Number(m[3]||0);const pack=extractPack(name);if(pack){out.push({name,qty:boxes*pack+loose,raw:line,boxes,loose,pack});}else out.push({name,qty:null,raw:line,boxes,loose,pack:null,invalid:true,reason:'Packing size not known yet; will try to infer it from a confident product match.'});continue;}
     m=line.match(/^(.*?)\s+(\d+(?:\.\d+)?)\s*(?:pcs?|pieces?|pes|pc)\s*$/i);if(m){out.push({name:m[1].trim(),qty:Number(m[2]),raw:line,boxes:0,loose:Number(m[2]),pack:null});continue;}
     // Explicit quantity format: Name, Qty or Name<TAB>Qty
     const parts=line.split(/[\t|;]+/).map(x=>x.trim()).filter(Boolean);if(parts.length>=2&&parseNum(parts[parts.length-1])!==null){out.push({name:parts.slice(0,-1).join(' '),qty:parseNum(parts[parts.length-1]),raw:line});continue;}
     out.push({name:line,qty:null,raw:line,invalid:true,reason:'Could not read quantity. Use e.g. 100ml NW 13box 400pes.'});
   }return out;}
 function extractPack(name){const m=String(name).match(/(?:-|\s)(\d{3,6})\s*$/);return m?Number(m[1]):null;}
-function attributeMismatch(a,b){const x=normalizeName(a),y=normalizeName(b);const cap=s=>{const m=s.match(/\b(\d+(?:\.\d+)?)\s*ml\b/);return m?m[1]:null};const ca=cap(x),cb=cap(y);if(ca&&cb&&ca!==cb)return `Capacity differs (${ca}ml vs ${cb}ml)`;const terms=['pet','hinge','hexa','plain','square','smily','rainbow','sipper','dom','flat','cc','ec','eco','party','bowl','tray','glass','lid','nw','nat','w'];for(const t of terms){const ax=new RegExp(`\\b${t}\\b`).test(x),by=new RegExp(`\\b${t}\\b`).test(y);if(ax!==by&&(['pet','hinge','hexa','plain','square','smily','rainbow','sipper','dom','flat','tray','glass','lid'].includes(t)))return `Product attribute may differ (${t})`;}const pa=extractPack(a),pb=extractPack(b);if(pa&&pb&&pa!==pb)return `Packing size differs (${pa} vs ${pb})`;return '';}
-function reconcile(actual,physical){const results=[],used=new Set();const threshold=.85;for(const a of actual){let best=null,bestScore=0,plausible=[];for(let i=0;i<physical.length;i++){if(used.has(i))continue;const p=physical[i];const score=similarity(a.name,p.name);const attr=attributeMismatch(a.name,p.name);const adjusted=attr?Math.min(score,.84):score;if(adjusted>bestScore){bestScore=adjusted;best={p,i,score,attr};}if(score>=.55)plausible.push({name:p.name,score:Math.round(score*100),attr});}
-    if(best&&bestScore>=threshold&&!best.attr){used.add(best.i);const p=best.p;const valid=a.qty!==null&&p.qty!==null;results.push({data1Name:a.name,data2Name:p.name,actualQty:a.qty,physicalQty:p.qty,diff:valid?p.qty-a.qty:null,status:!valid?'REVIEW':Math.abs(p.qty-a.qty)<1e-9?'MATCHED':'MISMATCH',reason:!valid?(a.invalid?'Actual quantity invalid':p.reason||'Quantity could not be calculated'):'',confidence:Math.round(bestScore*100),candidates:plausible.slice(0,3),actualIndex:actual.indexOf(a),physicalIndex:best.i,confirmed:false});}
-    else {const candidates=plausible.sort((u,v)=>v.score-u.score).slice(0,3);results.push({data1Name:a.name,data2Name:candidates[0]?.name||'',actualQty:a.qty,physicalQty:null,diff:null,status:'REVIEW',reason:best?.attr|| (candidates.length?'Possible product match needs confirmation':'No confident physical product match'),confidence:candidates[0]?.score||0,candidates,actualIndex:actual.indexOf(a),physicalIndex:null,confirmed:false});}}
-  for(let i=0;i<physical.length;i++){if(!used.has(i))results.push({data1Name:'',data2Name:physical[i].name,actualQty:null,physicalQty:physical[i].qty,diff:null,status:'MISSING_FROM_ACTUAL',reason:physical[i].invalid?physical[i].reason:'Physical item has no confident Actual Quantity match',confidence:0,candidates:[],actualIndex:null,physicalIndex:i,confirmed:false});}
-  // Items whose physical candidate is shown in a Review row must not also be treated as confidently consumed; they remain visible as candidates and the physical unmatched row is retained for safety.
-  return results;}
+function attributeMismatch(a,b){
+  const x=normalizeName(a),y=normalizeName(b);
+  const cap=s=>{const m=s.match(/\b(\d+(?:\.\d+)?)\s*ml\b/);return m?m[1]:null};
+  const ca=cap(x),cb=cap(y);
+  // Only flag an attribute when both names specify it and contradict each other.
+  if(ca&&cb&&ca!==cb)return `Capacity differs (${ca}ml vs ${cb}ml)`;
+  const terms=['pet','hinge','hexa','plain','square','smily','rainbow','sipper','dom','flat','tray','glass','lid'];
+  for(const t of terms){const ax=new RegExp(`\\b${t}\\b`).test(x),by=new RegExp(`\\b${t}\\b`).test(y);if(ax&&by===false){/* missing attribute is unknown, not a contradiction */continue;} }
+  const pa=extractPack(a),pb=extractPack(b);
+  if(pa&&pb&&pa!==pb)return `Packing size differs (${pa} vs ${pb})`;
+  return '';
+}
+function reconcile(actual,physical){
+  const results=[],used=new Set(),threshold=.85;
+  for(let ai=0;ai<actual.length;ai++){
+    const a=actual[ai];let best=null,bestScore=0,plausible=[];
+    for(let i=0;i<physical.length;i++){
+      if(used.has(i))continue;const p=physical[i];const score=similarity(a.name,p.name);const attr=attributeMismatch(a.name,p.name);
+      const adjusted=attr?Math.min(score,.84):score;
+      if(adjusted>bestScore){bestScore=adjusted;best={p,i,score,attr};}
+      if(score>=.55)plausible.push({name:p.name,score:Math.round(score*100),attr,physicalIndex:i});
+    }
+    // Infer box packing only after a strong name match. E.g. actual name ending
+    // SC-7200 + physical "80mm dom lid 5box 2850 pes" => 5*7200 + 2850.
+    if(best&&bestScore>=threshold&&!best.attr){
+      const p=best.p;
+      if(p.qty===null&&Number.isFinite(p.boxes)&&Number.isFinite(p.loose)){
+        const inferredPack=extractPack(a.name);
+        if(inferredPack&&inferredPack>0){p.pack=inferredPack;p.qty=p.boxes*inferredPack+(p.loose||0);p.inferredPack=true;p.reason=`Packing size inferred as ${inferredPack} pieces/box from matched Actual product name; verify if needed.`;p.invalid=false;}
+      }
+      used.add(best.i);const valid=a.qty!==null&&p.qty!==null;
+      const reason=!valid?(a.invalid?'Actual quantity invalid':p.reason||'Quantity could not be calculated'):(p.inferredPack?`Likely product match (${Math.round(bestScore*100)}% name confidence). Packing inferred as ${p.pack}/box; verify. ${p.qty===a.qty?'Quantities agree.':'Quantity difference calculated.'}`:'');
+      results.push({data1Name:a.name,data2Name:p.name,actualQty:a.qty,physicalQty:p.qty,diff:valid?p.qty-a.qty:null,status:!valid||p.inferredPack?'REVIEW':Math.abs(p.qty-a.qty)<1e-9?'MATCHED':'MISMATCH',reason,confidence:Math.round(bestScore*100),candidates:plausible.slice(0,3),actualIndex:ai,physicalIndex:best.i,confirmed:false,inferredPack:!!p.inferredPack});
+    } else {
+      const candidates=plausible.sort((u,v)=>v.score-u.score).slice(0,3);
+      results.push({data1Name:a.name,data2Name:candidates[0]?.name||'',actualQty:a.qty,physicalQty:null,diff:null,status:'REVIEW',reason:best?.attr||(candidates.length?'Possible product match needs confirmation':'No confident physical product match'),confidence:candidates[0]?.score||0,candidates,actualIndex:ai,physicalIndex:null,confirmed:false});
+    }
+  }
+  for(let i=0;i<physical.length;i++)if(!used.has(i))results.push({data1Name:'',data2Name:physical[i].name,actualQty:null,physicalQty:physical[i].qty,diff:null,status:'MISSING_FROM_ACTUAL',reason:physical[i].invalid?physical[i].reason:'Physical item has no confident Actual Quantity match',confidence:0,candidates:[],actualIndex:null,physicalIndex:i,confirmed:false});
+  return results;
+}
 function statusCounts(rows){const c={MATCHED:0,MISMATCH:0,REVIEW:0,MISSING_FROM_ACTUAL:0,MISSING_FROM_PHYSICAL:0};rows.forEach(r=>c[r.status]=(c[r.status]||0)+1);return c;}
 function showReconcile(){if(!state.chat){newChat().then(()=>showReconcile());return;}setView('reconPanel');$('reconError').textContent='';$('stockDate').value=dateToday();}
 async function readImport(file){if(!file)return '';const name=file.name.toLowerCase();if(name.endsWith('.xlsx')||name.endsWith('.xls')){const b=await file.arrayBuffer();const wb=XLSX.read(b,{type:'array'});return wb.SheetNames.map(n=>XLSX.utils.sheet_to_csv(wb.Sheets[n])).join('\n');}return await file.text();}
